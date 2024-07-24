@@ -17,6 +17,7 @@ from langgraph.graph.message import add_messages
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import FunctionMessage, HumanMessage
 from langgraph.prebuilt import ToolInvocation
+from langgraph.checkpoint.sqlite import SqliteSaver
 import json
 from langchain_core.messages import BaseMessage
 import datetime
@@ -40,6 +41,8 @@ OPENAI_API_KEY = os.environ['OPENAI_API_KEY']
 LANGCHAIN_API_KEY = os.environ['LANGCHAIN_API_KEY']
 POLYGON_API_KEY = os.environ['POLYGON_API_KEY']
 FMP_API_KEY = os.environ['FMP_API_KEY']
+
+memory = SqliteSaver.from_conn_string(":memory:")
 
 #-----DEFINE ADDITIONAL TOOLS AND FUNCTIONS-----#
 
@@ -138,7 +141,7 @@ def get_dcf(ticker:str) -> float:
         return dcf_data["dcf"]
     else:
         # return the error message
-        return f"Failed to retrieve data: {response.status_code}"
+        return f"Failed to retrieve data: {response.status_code}."
 
 def get_weights(market_cap, long_term_debt):
     e = market_cap
@@ -188,20 +191,19 @@ tool_executor = ToolExecutor(tool_belt)
 
 #-----INSTANTIATE MODEL AND BIND FUNCTIONS-----#
 
-model = ChatOpenAI(model="gpt-4o", temperature=0)
+model = ChatOpenAI(model="gpt-4o", temperature=0, streaming=True)
 
 functions = [convert_to_openai_function(t) for t in tool_belt]
 model = model.bind_functions(functions)
 
 #-----INSTANTIATE AGENT-----#
-
 class AgentState(TypedDict):
   messages: Annotated[list, add_messages]
 
 #-----CREATE NODES-----#
-def call_model(state):
+async def call_model(state:AgentState, config: RunnableConfig):
   messages = state["messages"]
-  response = model.invoke(messages)
+  response = await model.ainvoke(messages, config)
   return {"messages" : [response]}
 
 def call_tool(state):
@@ -215,7 +217,6 @@ def call_tool(state):
   )
 
   response = tool_executor.invoke(action)
-
   function_message = FunctionMessage(content=str(response), name=action.tool)
 
   return {"messages" : [function_message]}
@@ -243,6 +244,37 @@ workflow.add_conditional_edges(
     }
 )
 
+workflow.add_edge("use tool", "agent")
+app = workflow.compile() #can add checkpointer=memory argument here, need to figure out this error with it:
+                         #ValueError: Checkpointer requires one or more of the following 'configurable' keys: ['thread_id', 'thread_ts']
+                         #Has something to do with runnableconfig, may need a different kind of runnableconfig.
+
+#-----CONFIGURE CHAINLIT APP-----#
+
+@cl.set_starters
+async def set_starters():
+    return [
+        cl.Starter(
+            label="Market Research",
+            message="I am looking to diversify my portfolio with a stock in the restaurant industry. Can you find me a few well-valued stocks? Please provide valuation metrics and compare the stocks you find.",
+            ),
+
+        cl.Starter(
+            label="Financial Analysis",
+            message="Based on news sources, financial data, and valuation models, can you provide a full analysis of Crowdstrike stock? Include detailed numbers.",
+            ),
+
+        cl.Starter(
+            label="Performance Projection",
+            message="Based on historical data and news from the last two years, can you project how Meta stock may perform by the end of the year? Provide detailed financial numbers.",
+            ),
+
+        cl.Starter(
+            label="Stock Comparison",
+            message="Can you perform a financial analysis and comparison of Google and Apple stock? Which currently has a better valuation? Provide detailed numbers",
+            )
+        ]
+
 @cl.author_rename
 def rename(original_author: str):
     """
@@ -257,10 +289,8 @@ def rename(original_author: str):
 
 @cl.on_chat_start
 async def start_chat():
-
-    workflow.add_edge("use tool", "agent")
-    app = workflow.compile()
-
+    """
+    """
     cl.user_session.set("agent", app)
 
 @cl.on_message  
@@ -273,24 +303,22 @@ async def main(message: cl.Message):
     The LCEL RAG chain is stored in the user session, and is unique to each user session - this is why we can access it here.
     """
     agent = cl.user_session.get("agent")
-
+    inputs = {"messages" : [HumanMessage(content=str(message.content))]}
+    cb = cl.LangchainCallbackHandler(stream_final_answer=True)
+    config = RunnableConfig(callbacks=[cb])
     msg = cl.Message(content="")
-
-    if message.elements:
-        dfs = [read_csv(file.path) for file in message.elements if "csv" in file.mime]
-        message_to_send = {"messages": HumanMessage(content=message.content + '\nThe following is a pandas dataframe containing information that is relevant to the preceeding message:\n' + dfs[0])}
-    else:
-        message_to_send = {"messages": HumanMessage(content=message.content)}
-
-    async for chunk in agent.astream(
-        message_to_send,
-        config=RunnableConfig(callbacks=[cl.LangchainCallbackHandler()]),
-    ):
-        for key in chunk:
-            if key == "agent" and chunk[key].get("messages")[0].content is not None:
-                await msg.stream_token(chunk[key].get("messages")[0].content)
-
     await msg.send()
+
+    async for event in agent.astream_events(
+        inputs,
+        config=config,
+        version="v1"
+    ):
+        kind = event["event"]
+        if kind == "on_chat_model_stream":
+            await msg.stream_token(event["data"]["chunk"].content)
+
+    await msg.update()
 
 def read_csv(csv):
     df = pd.read_csv(csv,dtype=str)
